@@ -1,11 +1,15 @@
 #![no_std]
 #![no_main]
 
+use panic_probe as _;
+
 #[rtic::app(
     device = rp_pico::hal::pac,
-    dispatchers = [TIMER_IRQ_1]
+    dispatchers = [TIMER_IRQ_1],
+    peripherals = true,
 )]
 mod app {
+
     use rp_pico::hal::{
         self,
         clocks,
@@ -15,14 +19,11 @@ mod app {
         watchdog::Watchdog,
         Clock
     };
-    use smart_leds::{SmartLedsWrite, RGB8};
 
     use rp_pico::XOSC_CRYSTAL_FREQ;
 
     use embedded_hal::digital::v2::{OutputPin, ToggleableOutputPin};
     use rtic_monotonics::rp2040::*;
-
-    use panic_probe as _;
 
     #[shared]
     struct Shared {}
@@ -103,13 +104,13 @@ mod app {
 
     #[task(local = [neopixel])]
     async fn rainbow(ctx: rainbow::Context) {
-        use smart_leds::hsv::{Hsv, hsv2rgb};
+        use smart_leds::{SmartLedsWrite, hsv::{Hsv, hsv2rgb}};
 
         let mut hue: u8 = 0;
         loop {
             let color = hsv2rgb(Hsv{hue, sat: 230, val: 40});
 
-            ctx.local.neopixel.write([color].iter().copied());
+            let _ = ctx.local.neopixel.write([color].iter().copied());
             Timer::delay(10.millis()).await;
             hue = hue.wrapping_add(1);
         }
