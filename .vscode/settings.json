@@ -1,0 +1,9 @@
+{
+  "rust-analyzer.checkOnSave.allTargets": false,
+  "cSpell.words": [
+    "gpio",
+    "monotonics",
+    "pico",
+    "rtic"
+  ],
+}
