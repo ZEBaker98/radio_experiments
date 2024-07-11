@@ -19,35 +19,45 @@ pub static BOOT_LOADER: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 )]
 mod app {
     use crate::radio_cfg;
+    use embedded_hal::digital::{InputPin, OutputPin};
+    use embedded_hal_bus::spi::ExclusiveDevice;
     use fugit::RateExtU32;
-    use rp2040_hal as hal;
-    use hal::pac as pac;
-    use hal::gpio::{self, FunctionSio, FunctionSpi, SioOutput, SioInput, PullDown, PullNone, bank0};
-    use hal::Clock;
+    use hal::gpio::{self, bank0, FunctionSio, FunctionSpi, PullDown, SioOutput};
+    use hal::pac;
     use hal::pio::PIOExt;
     use hal::spi::Spi;
-    use embedded_hal_bus::spi::ExclusiveDevice;
-    use embedded_hal::digital::{OutputPin, InputPin};
-    use rtic_sync::{channel::*, make_channel};
+    use hal::Clock;
+    use rp2040_hal as hal;
     use rtic_monotonics::rp2040::prelude::*;
 
     const XTAL_FREQ_HZ: u32 = 12_000_000;
-
-    #[derive(Debug)]
-    enum RadioAction {
-        Send(smart_leds::RGB<u8>),
-        Recv,
-    }
 
     #[shared]
     struct Shared {}
 
     #[local]
     struct Local {
-        dio0_in: gpio::Pin<bank0::Gpio21, FunctionSio<SioInput>, PullNone>,
         led: gpio::Pin<bank0::Gpio13, FunctionSio<SioOutput>, PullDown>,
-        radio: rfm69::Rfm69<ExclusiveDevice<Spi<rp2040_hal::spi::Enabled, rp2040_pac::SPI1, (gpio::Pin<bank0::Gpio15, FunctionSpi, PullDown>, gpio::Pin<bank0::Gpio8, FunctionSpi, PullDown>, gpio::Pin<bank0::Gpio14, FunctionSpi, PullDown>)>, gpio::Pin<bank0::Gpio16, FunctionSio<SioOutput>, PullDown>, Mono>>,
-        neopixel: ws2812_pio::Ws2812Direct<pac::PIO0, rp2040_hal::pio::SM0, gpio::Pin<bank0::Gpio4, gpio::FunctionPio0, PullDown>>,
+        radio: rfm69::Rfm69<
+            ExclusiveDevice<
+                Spi<
+                    rp2040_hal::spi::Enabled,
+                    rp2040_pac::SPI1,
+                    (
+                        gpio::Pin<bank0::Gpio15, FunctionSpi, PullDown>,
+                        gpio::Pin<bank0::Gpio8, FunctionSpi, PullDown>,
+                        gpio::Pin<bank0::Gpio14, FunctionSpi, PullDown>,
+                    ),
+                >,
+                gpio::Pin<bank0::Gpio16, FunctionSio<SioOutput>, PullDown>,
+                Mono,
+            >,
+        >,
+        neopixel: ws2812_pio::Ws2812Direct<
+            pac::PIO0,
+            rp2040_hal::pio::SM0,
+            gpio::Pin<bank0::Gpio4, gpio::FunctionPio0, PullDown>,
+        >,
     }
     rp2040_timer_monotonic!(Mono);
 
@@ -65,7 +75,8 @@ mod app {
         )
         .unwrap();
 
-        let mut delay = cortex_m::delay::Delay::new(ctx.core.SYST, clocks.system_clock.freq().to_Hz());
+        let mut delay =
+            cortex_m::delay::Delay::new(ctx.core.SYST, clocks.system_clock.freq().to_Hz());
         Mono::start(ctx.device.TIMER, &ctx.device.RESETS);
 
         let sio = hal::Sio::new(ctx.device.SIO);
@@ -73,7 +84,7 @@ mod app {
             ctx.device.IO_BANK0,
             ctx.device.PADS_BANK0,
             sio.gpio_bank0,
-            &mut ctx.device.RESETS
+            &mut ctx.device.RESETS,
         );
 
         // Init LED
@@ -92,28 +103,23 @@ mod app {
             clocks.peripheral_clock.freq(),
         );
 
-        // Init radio dio0 input
-        let dio0_in = pins.gpio21.into_floating_input();
-        dio0_in.set_schmitt_enabled(true);
-
         // Init mode in pin
         let mut mode_in = pins.gpio0.into_pull_up_input();
-        
+
         // Init SPI bus pins
         let spi_pins = (
             pins.gpio15.into_function::<FunctionSpi>(),
             pins.gpio8.into_function::<FunctionSpi>(),
-            pins.gpio14.into_function::<FunctionSpi>()
+            pins.gpio14.into_function::<FunctionSpi>(),
         );
 
         // Init Spi bus
-        let radio_spi_bus: Spi<_, _, _, 8> = Spi::new(ctx.device.SPI1, spi_pins)
-            .init(
-                &mut ctx.device.RESETS,
-                clocks.peripheral_clock.freq(),
-                1u32.MHz(),
-                embedded_hal::spi::MODE_0
-            );
+        let radio_spi_bus: Spi<_, _, _, 8> = Spi::new(ctx.device.SPI1, spi_pins).init(
+            &mut ctx.device.RESETS,
+            clocks.peripheral_clock.freq(),
+            1u32.MHz(),
+            embedded_hal::spi::MODE_0,
+        );
 
         // Init Radio CS
         let mut cs = pins.gpio16.into_function();
@@ -127,9 +133,6 @@ mod app {
         radio_rst.set_low().unwrap();
         delay.delay_ms(10);
         radio_cfg::configure(&mut radio).unwrap();
-        
-        // Create radio action queue
-        let (radio_queue_sender, radio_queue_receiver) = make_channel!(RadioAction, 4);
 
         // Get Tx or Rx mode
         let tx_mode = mode_in.is_high().unwrap();
@@ -144,7 +147,11 @@ mod app {
         // Return resources and timer
         (
             Shared {},
-            Local { dio0_in, led, radio, neopixel },
+            Local {
+                led,
+                radio,
+                neopixel,
+            },
         )
     }
 
@@ -166,9 +173,16 @@ mod app {
 
     #[task(local = [neopixel, radio], priority = 1)]
     async fn rainbow(ctx: rainbow::Context, tx_mode: bool) {
-        use smart_leds::{hsv::{hsv2rgb, Hsv}, SmartLedsWrite};
-        if (tx_mode) {
-            let mut hsv = Hsv { hue: 0, sat: 230, val: 40 };
+        use smart_leds::{
+            hsv::{hsv2rgb, Hsv},
+            SmartLedsWrite,
+        };
+        if tx_mode {
+            let mut hsv = Hsv {
+                hue: 0,
+                sat: 230,
+                val: 40,
+            };
             loop {
                 let rgb = hsv2rgb(hsv);
                 ctx.local.neopixel.write([rgb].iter().copied()).unwrap();
