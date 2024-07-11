@@ -1,90 +1,61 @@
 #![no_std]
 #![no_main]
 
+//use defmt as _;
+//use defmt_rtt as _;
 use panic_probe as _;
 
-mod radio;
+mod radio_cfg;
 
-use rfm69::Rfm69;
-use rp_pico::hal::{self, pac, gpio::{self, FunctionSio, PullUp, SioInput, SioOutput, PullDown, FunctionPio0, FunctionSpi}};
-
-type Neopixel = ws2812_pio::Ws2812Direct<
-    hal::pac::PIO0,
-    hal::pio::SM0,
-    gpio::Pin<gpio::bank0::Gpio4, FunctionPio0, PullDown>,
->;
-
-// GPIO Types
-type PullUpInput<P> = gpio::Pin<P, FunctionSio<SioInput>, PullUp>;
-type PushPullOutput<P> = gpio::Pin<P, FunctionSio<SioOutput>, PullDown>;
-
-type Button1 = PullUpInput<gpio::bank0::Gpio0>;
-type RxOrTx = PullUpInput<gpio::bank0::Gpio1>;
-type OnboardLED = PushPullOutput<gpio::bank0::Gpio13>;
-type ExternalLED = PushPullOutput<gpio::bank0::Gpio2>;
-type RadioCS = PushPullOutput<gpio::bank0::Gpio16>;
-
-// Spi Types
-type SpiMosi = gpio::Pin<gpio::bank0::Gpio15, FunctionSpi, PullDown>;
-type SpiMiso = gpio::Pin<gpio::bank0::Gpio8, FunctionSpi, PullDown>;
-type SpiClock = gpio::Pin<gpio::bank0::Gpio14, FunctionSpi, PullDown>;
-
-type Spi = hal::spi::Spi<hal::spi::Enabled, pac::SPI1, (SpiMosi, SpiMiso, SpiClock)>;
-
-// Radio Type
-type Radio = Rfm69<RadioCS, Spi>;
-                
+#[link_section = ".boot2"]
+#[no_mangle]
+#[used]
+pub static BOOT_LOADER: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 #[rtic::app(
-    device = rp_pico::hal::pac,
+    device = rp2040_hal::pac,
     dispatchers = [SW0_IRQ, SW1_IRQ],
     peripherals = true,
 )]
 mod app {
-
+    use crate::radio_cfg;
     use fugit::RateExtU32;
-    use rp_pico::hal::{
-        self, clocks,
-        gpio::{self, FunctionPio0, FunctionSio, FunctionSpi, PullDown, SioOutput},
-        pio::PIOExt,
-        sio::Sio,
-        watchdog::Watchdog,
-        Clock,
-    };
+    use rp2040_hal as hal;
+    use hal::pac as pac;
+    use hal::gpio::{self, FunctionSio, FunctionSpi, SioOutput, SioInput, PullDown, PullNone, bank0};
+    use hal::Clock;
+    use hal::pio::PIOExt;
+    use hal::spi::Spi;
+    use embedded_hal_bus::spi::ExclusiveDevice;
+    use embedded_hal::digital::{OutputPin, InputPin};
+    use rtic_sync::{channel::*, make_channel};
+    use rtic_monotonics::rp2040::prelude::*;
 
-    use crate::radio::config_radio;
+    const XTAL_FREQ_HZ: u32 = 12_000_000;
 
-    use rp_pico::XOSC_CRYSTAL_FREQ;
-
-    use embedded_hal::{
-        digital::v2::{InputPin, OutputPin, ToggleableOutputPin},
-        spi::MODE_0,
-    };
-    use rtic_monotonics::rp2040::*;
+    #[derive(Debug)]
+    enum RadioAction {
+        Send(smart_leds::RGB<u8>),
+        Recv,
+    }
 
     #[shared]
     struct Shared {}
 
     #[local]
     struct Local {
-        neopixel: crate::Neopixel,
-        button1: crate::Button1,
-        rx_or_tx: crate::RxOrTx,
-        onboard_led: crate::OnboardLED,
-        external_led: crate::ExternalLED,
-        radio: crate::Radio,
+        dio0_in: gpio::Pin<bank0::Gpio21, FunctionSio<SioInput>, PullNone>,
+        led: gpio::Pin<bank0::Gpio13, FunctionSio<SioOutput>, PullDown>,
+        radio: rfm69::Rfm69<ExclusiveDevice<Spi<rp2040_hal::spi::Enabled, rp2040_pac::SPI1, (gpio::Pin<bank0::Gpio15, FunctionSpi, PullDown>, gpio::Pin<bank0::Gpio8, FunctionSpi, PullDown>, gpio::Pin<bank0::Gpio14, FunctionSpi, PullDown>)>, gpio::Pin<bank0::Gpio16, FunctionSio<SioOutput>, PullDown>, Mono>>,
+        neopixel: ws2812_pio::Ws2812Direct<pac::PIO0, rp2040_hal::pio::SM0, gpio::Pin<bank0::Gpio4, gpio::FunctionPio0, PullDown>>,
     }
+    rp2040_timer_monotonic!(Mono);
 
     #[init()]
     fn init(mut ctx: init::Context) -> (Shared, Local) {
-        // Initialize the interrupt for the RP2040 timer and obtain the token
-        // proving that we have.
-        let rp2040_timer_token = rtic_monotonics::create_rp2040_monotonic_token!();
-        // Configure the clocks, watchdog - The default is to generate a 125 MHz system clock
-        Timer::start(ctx.device.TIMER, &ctx.device.RESETS, rp2040_timer_token); // default rp2040 clock-rate is 125MHz
-        let mut watchdog = Watchdog::new(ctx.device.WATCHDOG);
-        let clocks = clocks::init_clocks_and_plls(
-            XOSC_CRYSTAL_FREQ,
+        let mut watchdog = hal::Watchdog::new(ctx.device.WATCHDOG);
+        let clocks = hal::clocks::init_clocks_and_plls(
+            XTAL_FREQ_HZ,
             ctx.device.XOSC,
             ctx.device.CLOCKS,
             ctx.device.PLL_SYS,
@@ -92,48 +63,25 @@ mod app {
             &mut ctx.device.RESETS,
             &mut watchdog,
         )
-        .ok()
         .unwrap();
 
-        // Init GPIO
-        let sio = Sio::new(ctx.device.SIO);
-        let pins = rp_pico::Pins::new(
+        let mut delay = cortex_m::delay::Delay::new(ctx.core.SYST, clocks.system_clock.freq().to_Hz());
+        Mono::start(ctx.device.TIMER, &ctx.device.RESETS);
+
+        let sio = hal::Sio::new(ctx.device.SIO);
+        let pins = gpio::bank0::Pins::new(
             ctx.device.IO_BANK0,
             ctx.device.PADS_BANK0,
             sio.gpio_bank0,
-            &mut ctx.device.RESETS,
-        );
-        
-        // Init LEDs
-        let mut onboard_led = pins.gpio13.into_push_pull_output();
-        onboard_led.set_low().unwrap();
-
-        let external_led = pins.gpio2.into_push_pull_output();
-        onboard_led.set_low().unwrap();
-
-        // Init Button
-        let button1 = pins.gpio0.into_pull_up_input();
-        button1.set_schmitt_enabled(true);
-        button1.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
-
-        let rx_or_tx = pins.gpio1.into_pull_up_input();
-
-        // Init SPI
-        let mosi = pins.gpio15.into_function();
-        let miso = pins.gpio8.into_function();
-        let sck = pins.gpio14.into_function();
-        let cs = pins.gpio16.into_function();
-
-        let spi: hal::spi::Spi<_, _, _, 8> = hal::spi::Spi::new(ctx.device.SPI1, (mosi, miso, sck)).init(
-            &mut ctx.device.RESETS,
-            125_000_000u32.Hz(),
-            16_000_000u32.Hz(),
-            MODE_0,
+            &mut ctx.device.RESETS
         );
 
-        let mut radio = crate::Rfm69::new(spi, cs);
+        // Init LED
+        let mut led = pins.gpio13.into_push_pull_output();
+        led.set_low().unwrap();
 
-        config_radio(&mut radio).ok();
+        let mut radio_rst = pins.gpio18.into_push_pull_output();
+        radio_rst.set_high().unwrap();
 
         // Init RGB LED
         let (mut pio0, sm0, _, _, _) = ctx.device.PIO0.split(&mut ctx.device.RESETS);
@@ -144,24 +92,59 @@ mod app {
             clocks.peripheral_clock.freq(),
         );
 
-        // Spawn tasks
-        heartbeat::spawn().ok();
-        rainbow::spawn().ok();
+        // Init radio dio0 input
+        let dio0_in = pins.gpio21.into_floating_input();
+        dio0_in.set_schmitt_enabled(true);
 
-        // Setup core for interrupt driven operation
+        // Init mode in pin
+        let mut mode_in = pins.gpio0.into_pull_up_input();
+        
+        // Init SPI bus pins
+        let spi_pins = (
+            pins.gpio15.into_function::<FunctionSpi>(),
+            pins.gpio8.into_function::<FunctionSpi>(),
+            pins.gpio14.into_function::<FunctionSpi>()
+        );
+
+        // Init Spi bus
+        let radio_spi_bus: Spi<_, _, _, 8> = Spi::new(ctx.device.SPI1, spi_pins)
+            .init(
+                &mut ctx.device.RESETS,
+                clocks.peripheral_clock.freq(),
+                1u32.MHz(),
+                embedded_hal::spi::MODE_0
+            );
+
+        // Init Radio CS
+        let mut cs = pins.gpio16.into_function();
+        cs.set_high().unwrap();
+
+        // Init Radio Spi Device
+        let radio_spi_device = ExclusiveDevice::new(radio_spi_bus, cs, Mono).unwrap();
+
+        // Init Radio
+        let mut radio = rfm69::Rfm69::new(radio_spi_device);
+        radio_rst.set_low().unwrap();
+        delay.delay_ms(10);
+        radio_cfg::configure(&mut radio).unwrap();
+        
+        // Create radio action queue
+        let (radio_queue_sender, radio_queue_receiver) = make_channel!(RadioAction, 4);
+
+        // Get Tx or Rx mode
+        let tx_mode = mode_in.is_high().unwrap();
+
+        // Start tasks
+        heartbeat::spawn().unwrap();
+        rainbow::spawn(tx_mode).unwrap();
+
+        // Enable sleep on exit ISR
         ctx.core.SCB.set_sleeponexit();
 
         // Return resources and timer
         (
             Shared {},
-            Local {
-                neopixel,
-                button1,
-                rx_or_tx,
-                onboard_led,
-                external_led,
-                radio,
-            },
+            Local { dio0_in, led, radio, neopixel },
         )
     }
 
@@ -172,40 +155,34 @@ mod app {
         }
     }
 
-    #[task(local = [onboard_led], priority = 1)]
+    #[task(local = [led], priority = 2)]
     async fn heartbeat(ctx: heartbeat::Context) {
+        use embedded_hal::digital::StatefulOutputPin;
         loop {
-            ctx.local.onboard_led.toggle().unwrap();
-            Timer::delay(1000.millis()).await;
+            ctx.local.led.toggle().unwrap();
+            Mono::delay(1000.millis()).await;
         }
     }
 
-    #[task(local = [neopixel], priority = 2)]
-    async fn rainbow(ctx: rainbow::Context) {
-        use smart_leds::{
-            hsv::{hsv2rgb, Hsv},
-            SmartLedsWrite,
-        };
-
-        let mut hue: u8 = 0;
-        loop {
-            let color = hsv2rgb(Hsv {
-                hue,
-                sat: 230,
-                val: 40,
-            });
-
-            let _ = ctx.local.neopixel.write([color].iter().copied());
-            Timer::delay(10.millis()).await;
-            hue = hue.wrapping_add(1);
-        }
-    }
-
-    #[task(binds = IO_IRQ_BANK0, local = [button1, external_led])]
-    fn button_handler(ctx: button_handler::Context) {
-        if ctx.local.button1.interrupt_status(gpio::Interrupt::EdgeLow) {
-            ctx.local.external_led.toggle().unwrap();
-            ctx.local.button1.clear_interrupt(gpio::Interrupt::EdgeLow);
+    #[task(local = [neopixel, radio], priority = 1)]
+    async fn rainbow(ctx: rainbow::Context, tx_mode: bool) {
+        use smart_leds::{hsv::{hsv2rgb, Hsv}, SmartLedsWrite};
+        if (tx_mode) {
+            let mut hsv = Hsv { hue: 0, sat: 230, val: 40 };
+            loop {
+                let rgb = hsv2rgb(hsv);
+                ctx.local.neopixel.write([rgb].iter().copied()).unwrap();
+                ctx.local.radio.send(&[rgb.r, rgb.g, rgb.b]).unwrap();
+                Mono::delay(5.millis()).await;
+                hsv.hue = hsv.hue.wrapping_add(1);
+            }
+        } else {
+            loop {
+                let mut buffer = [0; 3];
+                ctx.local.radio.recv(&mut buffer).unwrap();
+                let rgb = smart_leds::RGB::new(buffer[0], buffer[1], buffer[2]);
+                ctx.local.neopixel.write([rgb].iter().copied()).unwrap();
+            }
         }
     }
 }
