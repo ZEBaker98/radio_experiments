@@ -7,11 +7,11 @@ edition = "2021"
 
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["critical-section"] }
-# defmt = "0.3.8"
-# defmt-rtt = "0.4.1"
+defmt = { version = "0.3.8", optional = true }
+defmt-rtt = { version = "0.4.1", optional = true }
 embedded-hal = "1.0.0"
 embedded-hal-bus = "0.2.0"
-panic-probe = { version = "0.3.2"}#, features = ["print-defmt"] }
+panic-probe = { version = "0.3.2"}
 portable-atomic = { version = "1.6.0", features = ["critical-section"] }
 rfm69 = "0.6.0"
 rp2040-boot2 = "0.3.0"
@@ -25,3 +25,6 @@ ws2812-pio = "0.8.0"
 
 [profile.release]
 debug = 2
+
+[features]
+rtt = ["dep:defmt", "dep:defmt-rtt", "panic-probe/print-defmt"]

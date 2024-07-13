@@ -1,8 +1,11 @@
 #![no_std]
 #![no_main]
 
-//use defmt as _;
-//use defmt_rtt as _;
+#[cfg(feature = "rtt")]
+use defmt as _;
+#[cfg(feature = "rtt")]
+use defmt_rtt as _;
+
 use panic_probe as _;
 
 mod radio_cfg;

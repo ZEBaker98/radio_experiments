@@ -54,7 +54,5 @@ where
         pin: DioPin::Dio0,
         dio_mode: DioMode::Rx,
         dio_type: DioType::Dio01,
-    })?;
-
-    Ok(())
+    })
 }
